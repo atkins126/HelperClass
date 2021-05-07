@@ -3,21 +3,22 @@ unit DBExpress.MSSQL.Factory;
 interface
 
 uses
-  DBXCommon, Classes, DBXMetaDataProvider, DBXDataExpressMetaDataProvider,
-  DbxMsSql, DBXDynalink, Variants, Generics.Collections, DBXTypedTableStorage;
+  DBXCommon, Classes, DBXMetaDataProvider, DBXDataExpressMetaDataProvider, DB,
+  DbxMsSql,
+  DBXDynalink, Variants, Generics.Collections, DBXTypedTableStorage;
 
 type
   TDBXCommandHelper = class helper for TDBXCommand
-    function ParseSQL(DoCreate: Boolean): string;
-  end;
-
-  TDBXParameterListHelper = class helper for TDBXParameterList
-    function ParamsByNameToValue(AName: string; AValue: AnsiString): Integer; overload;
-    function ParamsByNameToValue(AName: string; AValue: string): Integer; overload;
-    function ParamsByNameToValue(AName: string; AValue: Integer): Integer; overload;
-    function ParamsByNameToValue(AName: string; AValue: Double): Integer; overload;
-    function ParamsByNameToValue(AName: string; AValue: Boolean): Integer; overload;
-    function ParamsByNameToValue(AName: string; AValue: TDateTime): Integer; overload;
+    /// <seealso>https://forums.devart.com/viewtopic.php?t=22342</seealso>
+    /// <code>
+    /// DBXPar := DBXCmd.CreateParameter;
+    /// DBXPar.DataType := TDBXDataTypes.BlobType;
+    /// DBXPar.Value.SetStream(TFileStream.Create(sArqXml, fmOpenRead), True);
+    /// DBXPar.Value.ValueType.ValueTypeFlags := DBXPar.Value.ValueType.ValueTypeFlags or TDBXValueTypeFlags.ExtendedType;
+    ///
+    /// DBXCmd.Parameters.AddParameter(DBXPar);
+    /// </code>
+    function CreateBlobParameter: TDBXParameter;
   end;
 
   TDBXParameterHelper = class helper for TDBXParameter
@@ -53,7 +54,6 @@ type
   private
     function DBXGetMetaProvider: TDBXMetaDataProvider;
     function DBXGetTables(const AProvider: TDBXMetaDataProvider): TDBXTablesTableStorage;
-  protected
   public
     /// <summary>
     /// Get Table List, ATableType is DBXMetaDataReader.TDBXTableType, have Table, View, Synonym, SystemTable and SystemView
@@ -62,7 +62,7 @@ type
     /// <returns></returns>
     function DBXGetTableList(const ATableType: string=''): TStrings;
 
-    constructor Create(const AHostName, ADatabase, AUserName, APassword: string); overload;
+    constructor Create(const AHostName, ADatabase, AUserName, APassword: string; const OSAuthentication: Boolean=False); overload;
     constructor Create(const AParams: TStrings); overload;
     destructor Destroy; override;
 
@@ -84,19 +84,12 @@ type
 implementation
 
 uses
-  SysUtils, SqlTimSt;
+  SysUtils, StrUtils, SqlTimSt;
 
-// uses DBXDevartSQLServer
-const DEVART_MSSQL_CONNECTION_STRING = ''
-  +'%s=DevartSQLServer;%s=%s;%s=%s;%s=%s;%s=%s'
-  +';BlobSize=-1;SchemaOverride=%%.dbo;LongStrings=True;EnableBCD=True'
-  +';FetchAll=True;UseUnicode=True;IPVersion=IPv4';
-  //+';Custom String=ApplicationName=A_NAME;WorkstationID=WID';
-// uses DbxMsSql
 const MSSQL_CONNECTION_STRING = ''
   +'%s=MSSQL;%s=%s;%s=%s;%s=%s;%s=%s'
   +';SchemaOverride=%%.dbo;BlobSize=-1;ErrorResourceFile=;LocaleCode=0000'
-  +';IsolationLevel=ReadCommitted;OS Authentication=False;Prepare SQL=True'
+  +';IsolationLevel=ReadCommitted;OS Authentication=%s;Prepare SQL=True'
   +';ConnectTimeout=60;Mars_Connection=False';
 
 /// <summary> fixed: Cursor not returned from Query </summary>
@@ -160,7 +153,7 @@ procedure FillParams(ASQLCommand: TDBXCommand; args: OleVariant);
 var
   LParamPos: Integer;
 begin
-  ASQLCommand.ParseSQL(True);
+  ASQLCommand.Prepare;
   //FCommand.Parameters.SetCount((VarArrayHighBound(args, 1) + 1)); // Only set, but it's null!
   if not(VarIsNull(args)) and not(VarIsEmpty(args)) then
     for LParamPos := 0 to (VarArrayHighBound(args, 1)) do
@@ -206,7 +199,7 @@ begin
 end;
 
 constructor TDBXMSSQLFactory.Create(const AHostName, ADatabase, AUserName,
-  APassword: string);
+  APassword: string; const OSAuthentication: Boolean=False);
 begin
   inherited Create;
 
@@ -216,7 +209,8 @@ begin
                          TDBXPropertyNames.HostName, AHostName,
                          TDBXPropertyNames.Database, ADatabase,
                          TDBXPropertyNames.UserName, AUserName,
-                         TDBXPropertyNames.Password, APassword]));
+                         TDBXPropertyNames.Password, APassword,
+                         IfThen(OSAuthentication, 'True', 'False')]));
   FConnectionFactory := TDBXConnectionFactory.GetConnectionFactory;
 end;
 
@@ -360,103 +354,11 @@ end;
 
 { TDBXCommandHelper }
 
-function TDBXCommandHelper.ParseSQL(DoCreate: Boolean): string;
-
-  function NameDelimiter(CurChar: Char): Boolean;
-  begin
-    case CurChar of
-      ' ', ',', ';', ')', #13, #10:
-        Result := True;
-    else
-      Result := False;
-    end;
-  end;
-
-var
-  LiteralChar, CurChar: Char;
-  CurPos, StartPos, BeginPos, NameStart: PChar;
-  Name: string;
-  LParam: TDBXParameter;
+function TDBXCommandHelper.CreateBlobParameter: TDBXParameter;
 begin
-  Result := '';
-
-  if DoCreate then
-    Parameters.ClearParameters;
-
-  StartPos := PChar(Text);
-  BeginPos := StartPos;
-  CurPos := StartPos;
-  while True do
-  begin
-    // Fast forward
-    while True do
-    begin
-      case CurPos^ of
-        #0, ':', '''', '"', '`':
-          Break;
-      end;
-      Inc(CurPos);
-    end;
-
-    case CurPos^ of
-      #0: // string end
-        Break;
-      '''', '"', '`': // literal
-        begin
-          LiteralChar := CurPos^;
-          Inc(CurPos);
-          // skip literal, escaped literal chars must not be handled because they
-          // end the string and start a new string immediately.
-          while (CurPos^ <> #0) and (CurPos^ <> LiteralChar) do
-            Inc(CurPos);
-          if CurPos^ = #0 then
-            Break;
-          Inc(CurPos);
-        end;
-      ':': // parameter
-        begin
-          Inc(CurPos);
-          if CurPos^ = ':' then
-            Inc(CurPos) // skip escaped ":"
-          else
-          begin
-            Result := Result + Copy(Text, StartPos - BeginPos + 1, CurPos - StartPos - 1) + '?';
-
-            LiteralChar := #0;
-            case CurPos^ of
-              '''', '"', '`':
-                begin
-                  LiteralChar := CurPos^;
-                  Inc(CurPos);
-                end;
-            end;
-            NameStart := CurPos;
-
-            CurChar := CurPos^;
-            while CurChar <> #0 do
-            begin
-              if (CurChar = LiteralChar) or
-                  ((LiteralChar = #0) and NameDelimiter(CurChar)) then
-                Break;
-              Inc(CurPos);
-              CurChar := CurPos^;
-            end;
-            SetString(Name, NameStart, CurPos - NameStart);
-            if LiteralChar <> #0 then
-              Inc(CurPos);
-            if DoCreate then
-            begin
-              LParam := CreateParameter;
-              LParam.Name := Name;
-              Parameters.AddParameter(LParam);
-            end;
-
-            StartPos := CurPos;
-          end;
-        end;
-    end;
-  end;
-  Result := Result + Copy(Text, StartPos - BeginPos + 1, CurPos - StartPos);
+  Result := TDBXParameter.Create(FDbxContext);
+  Result.DataType := TDBXDataTypes.BlobType;
+  Result.ValueTypeFlags := Result.ValueTypeFlags or TDBXValueTypeFlags.ExtendedType;
 end;
 
 { TDBXParameterHelper }
@@ -530,86 +432,6 @@ procedure TDBXParameterHelper.SetAsString(const AValue: string);
 begin
   DataType := TDBXDataTypes.WideStringType;
   Value.SetWideString(AValue);
-end;
-
-{ TDBXParameterListHelper }
-
-function TDBXParameterListHelper.ParamsByNameToValue(AName,
-  AValue: string): Integer;
-var
-  LPos01: Integer;
-begin
-  Result := Count;
-  for LPos01 := 0 to Count-1 do
-  begin
-    if SameText(Parameter[LPos01].Name, AName) then
-       Parameter[LPos01].AsString := AValue;
-  end;
-end;
-
-function TDBXParameterListHelper.ParamsByNameToValue(AName: string;
-  AValue: Integer): Integer;
-var
-  LPos01: Integer;
-begin
-  Result := Count;
-  for LPos01 := 0 to Count-1 do
-  begin
-    if SameText(Parameter[LPos01].Name, AName) then
-       Parameter[LPos01].AsInt32 := AValue;
-  end;
-end;
-
-function TDBXParameterListHelper.ParamsByNameToValue(AName: string;
-  AValue: Boolean): Integer;
-var
-  LPos01: Integer;
-begin
-  Result := Count;
-  for LPos01 := 0 to Count-1 do
-  begin
-    if SameText(Parameter[LPos01].Name, AName) then
-       Parameter[LPos01].AsBoolean := AValue;
-  end;
-end;
-
-function TDBXParameterListHelper.ParamsByNameToValue(AName: string;
-  AValue: TDateTime): Integer;
-var
-  LPos01: Integer;
-begin
-  Result := Count;
-  for LPos01 := 0 to Count-1 do
-  begin
-    if SameText(Parameter[LPos01].Name, AName) then
-       Parameter[LPos01].AsDateTime := AValue;
-  end;
-end;
-
-function TDBXParameterListHelper.ParamsByNameToValue(AName: string;
-  AValue: AnsiString): Integer;
-var
-  LPos01: Integer;
-begin
-  Result := Count;
-  for LPos01 := 0 to Count-1 do
-  begin
-    if SameText(Parameter[LPos01].Name, AName) then
-       Parameter[LPos01].AsAnsiString := AValue;
-  end;
-end;
-
-function TDBXParameterListHelper.ParamsByNameToValue(AName: string;
-  AValue: Double): Integer;
-var
-  LPos01: Integer;
-begin
-  Result := Count;
-  for LPos01 := 0 to Count-1 do
-  begin
-    if SameText(Parameter[LPos01].Name, AName) then
-       Parameter[LPos01].AsDouble := AValue;
-  end;
 end;
 
 end.
